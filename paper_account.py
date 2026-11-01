@@ -286,6 +286,7 @@ class PaperState:
         self.exchange.trades = state["trades"]
         self.positions = state["strategy_positions"]
         self.last_trade = state["last_trade"]
+        self.last_reversal_time = state.get("last_reversal_time", {})
         if set(self.positions) != set(self.exchange.positions):
             raise ValueError("Inconsistent saved positions")
 
@@ -303,6 +304,7 @@ class PaperState:
             "strategy_positions": self.positions,
             "prices": self.exchange.prices,
             "last_trade": self.last_trade,
+            "last_reversal_time": getattr(self, "last_reversal_time", {}),
             "trades": self.exchange.trades,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

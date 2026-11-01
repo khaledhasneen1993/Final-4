@@ -4,7 +4,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock
 from cascade_final4_paper import Final4PaperHunter
-from migrate_state import previous_reversal_settings, unfinished_reversal_settings
+from migrate_state import (
+    previous_reversal_settings,
+    unfinished_reversal_settings,
+    previous_final4_settings,
+)
 from fixtures import DynamicPublicData
 
 S = "BTC/USDT:USDT"
@@ -32,7 +36,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(restored.exchange.balance, bot.exchange.balance)
             self.assertEqual(next(path.parent.glob("*.bak")).read_bytes(), before)
             await restored.manage_exits()
-            self.assertEqual(len(restored.exchange.trades), 2)
+            self.assertEqual(len(restored.exchange.trades), 3)
 
     async def test_unfinished_plain_reversal_account_can_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +48,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
             state["settings"] = unfinished_reversal_settings()
             path.write_text(json.dumps(state))
             restored = Final4PaperHunter(path, market_data=data)
-            self.assertEqual(restored.positions[S]["sl"], 97)
+            self.assertEqual(restored.positions[S]["sl"], 97.2)
             self.assertEqual(restored.exchange.balance, bot.exchange.balance)
             self.assertEqual(len(list(path.parent.glob("*.bak"))), 1)
 
@@ -61,6 +65,42 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 Final4PaperHunter(path, market_data=data)
             self.assertEqual(path.read_bytes(), before)
+
+    async def test_old_final4_upgrade_tightens_stop_preserves_wallet_and_fills(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            data = DynamicPublicData()
+            bot = Final4PaperHunter(path, market_data=data)
+            await bot.enter(S, "buy", 100)
+            state = json.loads(path.read_text())
+            state["settings"] = previous_final4_settings()
+            p = state["strategy_positions"][S]
+            p.update(sl=97, initial_sl=97)
+            state.pop("last_reversal_time", None)
+            p.pop("was_reversal", None)
+            path.write_text(json.dumps(state))
+            before = path.read_bytes()
+            restored = Final4PaperHunter(path, market_data=data)
+            self.assertAlmostEqual(restored.positions[S]["sl"], 97.2)
+            self.assertEqual(restored.positions[S]["amount"], p["amount"])
+            self.assertEqual(restored.exchange.balance, state["balance_usdt"])
+            self.assertEqual(restored.exchange.trades, state["trades"])
+            self.assertEqual(restored.last_reversal_time, {})
+            self.assertEqual(next(path.parent.glob("*.bak")).read_bytes(), before)
+            self.assertIsNone(restored.settings()["max_combined_loss_pct"])
+
+    async def test_old_closer_stop_is_never_loosened(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            data = DynamicPublicData()
+            bot = Final4PaperHunter(path, market_data=data)
+            await bot.enter(S, "sell", 100)
+            state = json.loads(path.read_text())
+            state["settings"] = previous_final4_settings()
+            state["strategy_positions"][S]["sl"] = 101
+            path.write_text(json.dumps(state))
+            restored = Final4PaperHunter(path, market_data=data)
+            self.assertEqual(restored.positions[S]["sl"], 101)
 
 
 if __name__ == "__main__":

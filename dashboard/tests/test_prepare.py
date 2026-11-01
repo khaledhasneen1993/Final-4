@@ -22,7 +22,7 @@ class PrepareTests(unittest.TestCase):
     def test_idle_migration_keeps_balance_and_fills(self):
         self.path.write_text(json.dumps(self.state))
         prepare.prepare()
-        self.assertEqual(json.loads(self.path.read_text()), {**self.state,'settings':current_settings()})
+        self.assertEqual(json.loads(self.path.read_text()), {**self.state,'settings':current_settings(),'last_reversal_time':{}})
         self.assertEqual(len(list(self.path.parent.glob('*.bak'))), 1)
         before = self.path.read_bytes(); prepare.prepare()
         self.assertEqual(self.path.read_bytes(), before)

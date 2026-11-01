@@ -1,4 +1,4 @@
-"""Final-4 paper hedge positions: 3% stops, profit locks and one reversal per position."""
+"""Final-4 paper hedge positions: 2.8% stops, profit locks and reduced reversal size."""
 
 import argparse
 import asyncio
@@ -12,12 +12,13 @@ from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter
 from binance_cascade_hunter_dynamic_v2 import log
 from paper_account import ReversalStopCrossed
 
-HARD_STOP_PCT = 0.03
+HARD_STOP_PCT = 0.028
 REVERSAL_TRIGGER = 0.018
-REVERSAL_SIZE_MULT = 0.60
-REVERSAL_CONFIRM_PROFIT = 0.012
+REVERSAL_SIZE_MULT = 0.45
+REVERSAL_CONFIRM_PROFIT = 0.007
+REVERSAL_COOLDOWN_SEC = 600
 PROFIT_LOCK_LEVELS = [
-    (0.010, 0.000),
+    (0.010, 0.0001),
     (0.015, 0.005),
     (0.020, 0.010),
     (0.025, 0.015),
@@ -39,11 +40,13 @@ class Final4PaperHunter(V2PaperHunter):
             from migrate_state import migrate
 
             migrate(state_path)
+        self.last_reversal_time = {}
         super().__init__(state_path, fee_rate, reset, market_data)
         for key, p in self.positions.items():
             p.setdefault("symbol", self.exchange.positions[key].get("symbol", key))
             p.setdefault("position_id", key)
             p.setdefault("is_reversal", False)
+            p.setdefault("was_reversal", p["is_reversal"])
             p.setdefault("profit_lock_trigger", 0.0)
 
     def settings(self):
@@ -57,6 +60,11 @@ class Final4PaperHunter(V2PaperHunter):
             "reversal_trigger": REVERSAL_TRIGGER,
             "reversal_size_mult": REVERSAL_SIZE_MULT,
             "reversal_confirm_profit": REVERSAL_CONFIRM_PROFIT,
+            "max_combined_loss_pct": None,
+            "reversal_cooldown_sec": REVERSAL_COOLDOWN_SEC,
+            "original_partial_fraction": 0.50,
+            "post_reversal_stop_pct": 0.007,
+            "post_reversal_stop_basis": "current_price",
             "profit_lock_levels": [list(level) for level in PROFIT_LOCK_LEVELS],
         }
 
@@ -84,6 +92,7 @@ class Final4PaperHunter(V2PaperHunter):
             reverse_of=None,
             parent=None,
             is_reversal=False,
+            was_reversal=False,
             profit_locked=0.0,
             profit_lock_trigger=0.0,
             stop_kind="SL",
@@ -149,6 +158,8 @@ class Final4PaperHunter(V2PaperHunter):
             },
         )
         self.exchange.trades[-1]["trigger_price"] = float(trigger_price)
+        if p.get("is_reversal") or p.get("was_reversal"):
+            self.last_reversal_time[symbol] = time.time()
         del self.positions[position_id]
         for child in self.positions.values():
             if child.get("parent") == position_id:
@@ -179,7 +190,7 @@ class Final4PaperHunter(V2PaperHunter):
                         )
                         p.update(profit_locked=lock, profit_lock_trigger=trigger)
                         log.info(
-                            "PROFIT LOCK %s [%s] | +%.1f%%", symbol, key, lock * 100
+                            "PROFIT LOCK %s [%s] | +%.2f%%", symbol, key, lock * 100
                         )
                 if p.get("is_reversal"):
                     await self.check_reversal_success(key, price)
@@ -202,6 +213,11 @@ class Final4PaperHunter(V2PaperHunter):
         if len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS:
             return False
         symbol = original_pos.get("symbol", position_id)
+        if (
+            time.time() - self.last_reversal_time.get(symbol, 0)
+            <= REVERSAL_COOLDOWN_SEC
+        ):
+            return False
         reverse_side = "sell" if original_pos["side"] == "buy" else "buy"
         sig = await self.detect_cascade(symbol)
         if not sig or not (
@@ -227,11 +243,26 @@ class Final4PaperHunter(V2PaperHunter):
                 },
             )
             child = self.position(reverse_id, symbol, fill)
-            child.update(is_reversal=True, parent=position_id, reverse_of=position_id)
+            child.update(
+                is_reversal=True,
+                was_reversal=True,
+                parent=position_id,
+                reverse_of=position_id,
+            )
             self.positions[reverse_id] = child
             original_pos.update(
                 reversed=True, reverse_side=reverse_side, reverse_position_id=reverse_id
             )
+            self.save()
+            # تخفيف الأصلية فور نجاح المعاكسة، ثم شد وقف المتبقي.
+            await self.partial_close_original(
+                position_id, 0.50, price, "REVERSAL_HEDGE"
+            )
+            original_pos = self.positions.get(position_id)
+            if original_pos:
+                direction = 1 if original_pos["side"] == "buy" else -1
+                tight_sl = price * (1 - direction * 0.007)
+                self.tighten_stop(original_pos, tight_sl, "TIGHT_AFTER_REV")
             self.save()
             log.info(
                 "REVERSAL %s %s [%s] | @ %.8f",
@@ -248,6 +279,42 @@ class Final4PaperHunter(V2PaperHunter):
             return False
         except Exception as error:
             log.warning("Reversal failed %s: %s", symbol, error)
+            return False
+
+    async def partial_close_original(self, position_id, fraction, price, reason):
+        p = self.positions.get(position_id)
+        if not p:
+            return False
+        amount = float(
+            self.exchange.amount_to_precision(p["symbol"], p["amount"] * fraction)
+        )
+        if amount <= 0 or amount >= p["amount"] * 0.95:
+            return False
+        try:
+            side = "sell" if p["side"] == "buy" else "buy"
+            await self.exchange.create_order(
+                p["symbol"],
+                "market",
+                side,
+                amount,
+                params={
+                    "reduceOnly": True,
+                    "positionId": position_id,
+                    "exit_reason": reason,
+                },
+            )
+            if position_id in self.exchange.positions:
+                p["amount"] = self.exchange.positions[position_id]["amount"]
+            else:
+                if position_id in self.positions:
+                    del self.positions[position_id]
+            log.info(
+                "%s %s | closed %.0f%% of original", reason, p["symbol"], fraction * 100
+            )
+            self.save()
+            return True
+        except Exception as e:
+            log.warning("Partial close original failed: %s", e)
             return False
 
     async def check_reversal_success(self, position_id, price):

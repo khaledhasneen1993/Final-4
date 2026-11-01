@@ -1,4 +1,4 @@
-"""Back up compatible state upgrades; never change risk rules of old open positions."""
+"""Back up known state upgrades; preserve fills and quantities, only tighten old stops."""
 
 import argparse
 import copy
@@ -68,8 +68,28 @@ def previous_final3_settings():
     return dict(previous_protection_settings(), STOP_LOSS_PCT=0.05)
 
 
-def unfinished_reversal_settings():
+def previous_final4_settings():
     settings = current_settings().copy()
+    for key in (
+        "max_combined_loss_pct",
+        "reversal_cooldown_sec",
+        "original_partial_fraction",
+        "post_reversal_stop_pct",
+        "post_reversal_stop_basis",
+    ):
+        settings.pop(key)
+    settings.update(
+        STOP_LOSS_PCT=0.03,
+        hard_stop_pct=0.03,
+        reversal_size_mult=0.60,
+        reversal_confirm_profit=0.012,
+    )
+    settings["profit_lock_levels"][0] = [0.010, 0.0]
+    return settings
+
+
+def unfinished_reversal_settings():
+    settings = previous_final4_settings()
     settings.pop("hedge_positions")
     settings["TAKE_PROFIT_PCT"] = 0.018
     settings["mode"] = "final3_smart_reversal"
@@ -77,7 +97,7 @@ def unfinished_reversal_settings():
 
 
 def previous_reversal_settings():
-    settings = current_settings().copy()
+    settings = previous_final4_settings()
     settings["mode"] = "final3_smart_reversal"
     return settings
 
@@ -97,7 +117,7 @@ def plan(path):
         old_scale_settings(),
         unfinished_reversal_settings(),
     ]
-    allowed.append(previous_reversal_settings())
+    allowed.extend([previous_reversal_settings(), previous_final4_settings()])
     if previous not in allowed:
         raise ValueError("Unrecognized state settings; original preserved")
     accounts = state.get("account_positions")
@@ -111,6 +131,7 @@ def plan(path):
     if accounts and previous not in (
         unfinished_reversal_settings(),
         previous_reversal_settings(),
+        previous_final4_settings(),
     ):
         raise ValueError(
             "Old scale-in positions are open. Resume the old version or use a NEW --state/session; original preserved"
@@ -134,8 +155,8 @@ def plan(path):
     state = copy.deepcopy(state)
     for key, fill in state["account_positions"].items():
         p = state["strategy_positions"][key]
-        if previous == previous_reversal_settings():
-            # Only the repository identity changes; keep both position IDs and links.
+        if previous in (previous_reversal_settings(), previous_final4_settings()):
+            # Keep both position IDs and links; apply the approved stop cap below.
             if (
                 p.get("symbol", key) != fill.get("symbol", key)
                 or p.get("side") != fill.get("side")
@@ -175,6 +196,19 @@ def plan(path):
             ),
             default=0,
         )
+    for key, p in state["strategy_positions"].items():
+        p["initial_sl"] = p["entry"] * (
+            1 - current["hard_stop_pct"]
+            if p["side"] == "buy"
+            else 1 + current["hard_stop_pct"]
+        )
+        candidate = p["initial_sl"]
+        improves = candidate > p["sl"] if p["side"] == "buy" else candidate < p["sl"]
+        if improves:
+            p["sl"] = candidate
+            p["stop_kind"] = "SL"
+        p.setdefault("was_reversal", p.get("is_reversal", False) or "_REV_" in key)
+    state.setdefault("last_reversal_time", {})
     state["settings"] = current
     return state, True
 
