@@ -56,3 +56,32 @@ class RiskControls:
             return max(entry * (1 + lock), break_even)
         break_even = (entry * amount - paid + realized) / (amount * (1 + fee)) - buffer
         return min(entry * (1 - lock), break_even)
+
+
+def upgrade_margin_only(state, current):
+    """Keep existing quantities intact when only approved entry margin changes."""
+    import math
+
+    if state.get("settings") != {**current, "MAX_POSITION_PCT": 0.01}:
+        return False
+    accounts, positions = state.get("account_positions"), state.get(
+        "strategy_positions"
+    )
+    wallet = state.get("balance_usdt")
+    if (
+        state.get("version") != 1
+        or not isinstance(accounts, dict)
+        or not isinstance(positions, dict)
+        or set(accounts) != set(positions)
+        or not isinstance(wallet, (float, int))
+        or not math.isfinite(wallet)
+        or not isinstance(state.get("trades"), list)
+        or not isinstance(state.get("last_trade"), dict)
+    ):
+        raise ValueError("Invalid margin-upgrade account; original preserved")
+    for key, p in positions.items():
+        fill = accounts[key]
+        if p.get("side") != fill.get("side") or p.get("amount") != fill.get("amount"):
+            raise ValueError("Inconsistent positions; original preserved")
+    state["settings"] = current
+    return True

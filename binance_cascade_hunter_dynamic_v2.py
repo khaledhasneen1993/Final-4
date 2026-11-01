@@ -1,5 +1,5 @@
 # language: Python 3.11+, file: binance_cascade_hunter_dynamic_v2.py
-# target: Binance USDT-M Futures — Final-4 shared base: 1% wallet margin, 50x, max 3
+# target: Binance USDT-M Futures — Final-4 shared base: 5% wallet margin, 50x, max 3
 # deps: pip install ccxt pandas numpy aiohttp
 
 import asyncio
@@ -13,7 +13,7 @@ log = logging.getLogger("CASCADE")
 # === CONFIG ===
 
 LEVERAGE = 50
-MAX_POSITION_PCT = 0.01  # 1% من رصيد المحفظة الحالي
+MAX_POSITION_PCT = 0.05  # 5% من رصيد المحفظة الحالي
 CASCADE_THRESHOLD = 0.012  # 1.2%
 VOLUME_SPIKE = 3.5
 TAKE_PROFIT_PCT = 0.018

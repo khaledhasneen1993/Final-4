@@ -1,5 +1,6 @@
 """Back up known state upgrades; preserve fills and quantities, only tighten old stops."""
 
+from risk_controls import upgrade_margin_only
 import argparse
 import copy
 import json
@@ -142,6 +143,8 @@ LEGACY_APPROVED_SETTINGS = {
 def plan(path):
     state = json.loads(Path(path).read_text(encoding="utf-8"))
     current = current_settings()
+    if upgrade_margin_only(state, current):
+        return state, True
     if state.get("settings") == LEGACY_APPROVED_SETTINGS:
         if state.get("account_positions") or state.get("strategy_positions"):
             raise ValueError(

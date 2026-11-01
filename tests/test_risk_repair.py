@@ -81,7 +81,7 @@ class RiskRepairTests(unittest.IsolatedAsyncioTestCase):
             self.bot.exchange.trades[-1]["price_source"], "websocket_kline_last"
         )
         rest.assert_not_awaited()
-        self.assertAlmostEqual(self.bot.exchange.used, 1)
+        self.assertAlmostEqual(self.bot.exchange.used, 5)
 
     async def test_stale_stream_never_masks_stale_rest(self):
         self.update()
@@ -183,7 +183,7 @@ class RiskRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.bot.enter(S, "buy", 100))
         self.data.price = 100
         self.assertFalse(await self.bot.partial_close(S, 0.4, 98.7, "PARTIAL_1"))
-        self.assertEqual(self.bot.positions[S]["amount"], 0.5)
+        self.assertEqual(self.bot.positions[S]["amount"], 2.5)
         self.assertEqual(len(self.bot.exchange.trades), 1)
 
     @unittest.skipIf(IS_THREE, "Final-4 reversal feature")
@@ -309,3 +309,17 @@ class RiskRepairTests(unittest.IsolatedAsyncioTestCase):
         await self.sc.evaluate(S)
         self.data.fetch_order_book.assert_not_awaited()
         self.assertFalse(self.bot.exchange.trades)
+
+    async def test_margin_only_upgrade_preserves_open_positions_and_balance(self):
+        self.assertTrue(await self.bot.enter(S, "buy", 100))
+        old = json.loads(self.path.read_text())
+        old["settings"]["MAX_POSITION_PCT"] = 0.01
+        self.path.write_text(json.dumps(old))
+        before = self.path.read_bytes()
+        restored = Hunter(self.path, market_data=self.data)
+        self.assertEqual(restored.settings()["MAX_POSITION_PCT"], 0.05)
+        self.assertEqual(restored.positions, old["strategy_positions"])
+        self.assertEqual(restored.exchange.positions, old["account_positions"])
+        self.assertEqual(restored.exchange.balance, old["balance_usdt"])
+        self.assertEqual(restored.exchange.trades, old["trades"])
+        self.assertEqual(next(self.path.parent.glob("*.bak")).read_bytes(), before)
