@@ -71,6 +71,8 @@ class ContinuousScanner:
         self.next_book_request = 0.0
         self.book_pause_until = 0.0
         self.events = self.book_checks = self.entries = 0
+        self.resync_tasks = {}
+        self.stale_notice_at = -math.inf
 
     async def refresh_universe(self):
         symbols = await self.bot.get_top_symbols()
@@ -92,6 +94,15 @@ class ContinuousScanner:
             except Exception as error:
                 self.config.log.warning("Skipping market %s: %s", symbol, error)
         selected = tuple(accepted[: self.config.MAX_SYMBOLS_TO_SCAN])
+        # Keep price updates for open positions even after they leave the top 40.
+        open_symbols = [p.get("symbol", key) for key, p in self.bot.positions.items()]
+        for symbol in open_symbols:
+            if symbol not in selected:
+                market = self.bot.exchange.market_data.market(symbol)
+                self.stream_ids[symbol] = market.get("id") or symbol.split(":")[
+                    0
+                ].replace("/", "")
+                selected += (symbol,)
         if selected != self.symbols:
             self.symbols = selected
             self.changed.set()
@@ -182,6 +193,22 @@ class ContinuousScanner:
         self.events += 1
         self.schedule(symbol)
 
+    def execution_quote(self, symbol):
+        if (
+            not self.connected
+            or symbol not in self.received
+            or symbol not in self.histories
+        ):
+            return None
+        age = self.wall_clock() - self.event_times.get(symbol, 0) / 1000
+        if self.clock() - self.received[symbol] > 2 or not -2 <= age <= 2:
+            return None
+        return {
+            "last": self.histories[symbol][-1][4],
+            "timestamp": self.event_times[symbol],
+            "source": "websocket_kline_last",
+        }
+
     def signal(self, symbol):
         if (
             not self.connected
@@ -215,6 +242,8 @@ class ContinuousScanner:
         )
 
     async def evaluate(self, symbol):
+        if getattr(self.bot, "risk_paused", lambda: False)():
+            return
         if (
             self.has_position(symbol)
             or len(self.bot.positions) >= self.config.MAX_CONCURRENT_POSITIONS
@@ -235,9 +264,12 @@ class ContinuousScanner:
             if self.clock() < self.book_pause_until or self.signal(symbol) is None:
                 return
             self.next_book_request = self.clock() + BOOK_REQUEST_SPACING
+        book_requested_at = self.clock()
         try:
             self.book_checks += 1
-            book = await self.bot.exchange.fetch_order_book(symbol, limit=20)
+            book = await asyncio.wait_for(
+                self.bot.exchange.fetch_order_book(symbol, limit=20), 2.0
+            )
             bids = sum(float(x[1]) for x in book["bids"][:20])
             asks = sum(float(x[1]) for x in book["asks"][:20])
             if not all(math.isfinite(v) and v >= 0 for v in (bids, asks)):
@@ -249,8 +281,11 @@ class ContinuousScanner:
                 "Order book check failed %s (backoff 5s): %s", symbol, error
             )
             return
+        book_checked_at = book_requested_at
         async with self.bot.lock:
             signal = self.signal(symbol)
+            if self.clock() - book_checked_at > 2:
+                return
             if (
                 signal is None
                 or self.has_position(symbol)
@@ -294,7 +329,24 @@ class ContinuousScanner:
                 payload = message.json()
                 if "code" in payload:
                     raise ConnectionError(str(payload))
-                self.ingest(payload)
+                try:
+                    self.ingest(payload)
+                except CandleGap as error:
+                    symbol = str(error)
+                    self.received.pop(symbol, None)
+                    self.event_times.pop(symbol, None)
+                    self.histories.pop(symbol, None)
+                    if symbol not in self.resync_tasks:
+                        self.resync_tasks[symbol] = asyncio.create_task(
+                            self.seed((symbol,))
+                        )
+                        self.resync_tasks[symbol].add_done_callback(
+                            lambda task, key=symbol: self.resync_tasks.pop(key, None)
+                        )
+                    self.config.log.warning(
+                        "Isolated candle resync %s; other markets remain connected",
+                        symbol,
+                    )
             elif message.type in (
                 aiohttp.WSMsgType.ERROR,
                 aiohttp.WSMsgType.CLOSE,
@@ -327,9 +379,17 @@ class ContinuousScanner:
         while True:
             await asyncio.sleep(WATCHDOG_INTERVAL)
             stale = self.stale_symbols(symbols, started)
-            if stale:
-                self.connected = False  # Block new signals before reconnect cleanup.
-                raise ConnectionError("No fresh accepted candles: " + ", ".join(stale))
+            if stale and len(stale) == len(symbols):
+                self.connected = False
+                raise ConnectionError(
+                    "All watched markets stopped updating: " + ", ".join(stale)
+                )
+            if stale and self.clock() - self.stale_notice_at >= 60:
+                self.stale_notice_at = self.clock()
+                self.config.log.warning(
+                    "Stale markets blocked individually; healthy streams retained: %s",
+                    ", ".join(stale),
+                )
 
     async def stream_loop(self):
         await self.ready.wait()
@@ -392,6 +452,10 @@ class ContinuousScanner:
                             await asyncio.gather(
                                 reader, change, reseed, watchdog, return_exceptions=True
                             )
+                            resync = list(self.resync_tasks.values())
+                            for task in resync:
+                                task.cancel()
+                            await asyncio.gather(*resync, return_exceptions=True)
                 except Exception as error:
                     self.connected = False
                     self.config.log.warning(
@@ -426,3 +490,7 @@ class ContinuousScanner:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            resync = list(self.resync_tasks.values())
+            for task in resync:
+                task.cancel()
+            await asyncio.gather(*resync, return_exceptions=True)

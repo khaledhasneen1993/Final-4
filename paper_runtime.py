@@ -16,32 +16,65 @@ class DynamicPaperExchange(PaperExchange):
 
 
 class DynamicPaperHunter(dynamic.CascadeHunter, PaperState):
-    def __init__(self, state_path="paper_state_dynamic_v2.json", fee_rate=0.0005,
-                 reset=False, market_data=None, strategy_config=dynamic):
+    def __init__(
+        self,
+        state_path="paper_state_dynamic_v2.json",
+        fee_rate=0.0005,
+        reset=False,
+        market_data=None,
+        strategy_config=dynamic,
+    ):
         self.strategy = strategy_config
         # Only public market data is used; all fills go through PaperExchange.
-        public = market_data if market_data is not None else ccxt.binanceusdm({
-            "enableRateLimit": True, "options": {"defaultType": "future"},
-        })
-        self.exchange = DynamicPaperExchange(public, fee_rate, leverage=self.strategy.LEVERAGE)
+        public = (
+            market_data
+            if market_data is not None
+            else ccxt.binanceusdm(
+                {
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "future"},
+                }
+            )
+        )
+        self.exchange = DynamicPaperExchange(
+            public, fee_rate, leverage=self.strategy.LEVERAGE
+        )
         self.positions = {}
         self.last_trade = {}
+        self.risk_memory = {"peak_balance": 100.0, "entries_paused": False}
         self.lock = asyncio.Lock()
         self.state_path = Path(state_path)
         if self.state_path.exists() and not reset:
             self.restore()
         self.scanner = ContinuousScanner(self, config=self.strategy)
+        self.exchange.scanner = self.scanner
 
     def settings(self):
-        return {"mode": "dynamic_scan", **{name: getattr(self.strategy, name) for name in (
-            "LEVERAGE", "MAX_POSITION_PCT", "CASCADE_THRESHOLD", "VOLUME_SPIKE",
-            "TAKE_PROFIT_PCT", "STOP_LOSS_PCT", "COOLDOWN_SEC", "SCAN_INTERVAL",
-            "MAX_SYMBOLS_TO_SCAN", "MAX_CONCURRENT_POSITIONS", "MIN_QUOTE_VOLUME",
-        )}}
+        return {
+            "mode": "dynamic_scan",
+            **{
+                name: getattr(self.strategy, name)
+                for name in (
+                    "LEVERAGE",
+                    "MAX_POSITION_PCT",
+                    "CASCADE_THRESHOLD",
+                    "VOLUME_SPIKE",
+                    "TAKE_PROFIT_PCT",
+                    "STOP_LOSS_PCT",
+                    "COOLDOWN_SEC",
+                    "SCAN_INTERVAL",
+                    "MAX_SYMBOLS_TO_SCAN",
+                    "MAX_CONCURRENT_POSITIONS",
+                    "MIN_QUOTE_VOLUME",
+                )
+            },
+        }
 
     async def enter(self, symbol, side, price):
         # ContinuousScanner owns the entry lock; do not acquire it again here.
-        result = await self.strategy.CascadeHunter.enter(self, symbol, side, float(price))
+        result = await self.strategy.CascadeHunter.enter(
+            self, symbol, side, float(price)
+        )
         self.save()
         return result
 
@@ -75,11 +108,16 @@ class DynamicPaperHunter(dynamic.CascadeHunter, PaperState):
         try:
             await self.exchange.load_markets()
             self.save()
-            dynamic.log.info("CONTINUOUS PAPER ONLY | initial=100 USDT | wallet=%.4f | state=%s",
-                             self.exchange.balance, self.state_path)
-            tasks = [asyncio.create_task(self.scan_loop()),
-                     asyncio.create_task(self.exit_watcher()),
-                     asyncio.create_task(self.report())]
+            dynamic.log.info(
+                "CONTINUOUS PAPER ONLY | initial=100 USDT | wallet=%.4f | state=%s",
+                self.exchange.balance,
+                self.state_path,
+            )
+            tasks = [
+                asyncio.create_task(self.scan_loop()),
+                asyncio.create_task(self.exit_watcher()),
+                asyncio.create_task(self.report()),
+            ]
             await asyncio.gather(*tasks)
         finally:
             for task in tasks:

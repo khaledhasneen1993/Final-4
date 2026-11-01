@@ -10,13 +10,17 @@ from uuid import uuid4
 
 from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter
 from binance_cascade_hunter_dynamic_v2 import log
-from paper_account import ReversalStopCrossed
+from risk_controls import RiskControls
+from paper_account import ReversalStopCrossed, PartialStopCrossed
 
 HARD_STOP_PCT = 0.028
 REVERSAL_TRIGGER = 0.018
 REVERSAL_SIZE_MULT = 0.45
 REVERSAL_CONFIRM_PROFIT = 0.007
 REVERSAL_COOLDOWN_SEC = 600
+REVERSAL_SIGNAL_MOVE = 0.006
+REVERSAL_SIGNAL_VOLUME = 1.5
+REVERSAL_SIGNAL_IMBALANCE = 0.15
 PROFIT_LOCK_LEVELS = [
     (0.010, 0.0001),
     (0.015, 0.005),
@@ -28,7 +32,7 @@ PROFIT_LOCK_LEVELS = [
 ]
 
 
-class Final4PaperHunter(V2PaperHunter):
+class Final4PaperHunter(RiskControls, V2PaperHunter):
     def __init__(
         self,
         state_path="paper_state_final4.json",
@@ -41,6 +45,7 @@ class Final4PaperHunter(V2PaperHunter):
 
             migrate(state_path)
         self.last_reversal_time = {}
+        self.reversal_stats = {}
         super().__init__(state_path, fee_rate, reset, market_data)
         for key, p in self.positions.items():
             p.setdefault("symbol", self.exchange.positions[key].get("symbol", key))
@@ -53,15 +58,22 @@ class Final4PaperHunter(V2PaperHunter):
         return {
             **super().settings(),
             "mode": "final4_smart_reversal",
+            **self.risk_settings(),
+            "position_basis": "wallet_total",
+            "stop_basis": "original_fill_price",
             "STOP_LOSS_PCT": HARD_STOP_PCT,
             "TAKE_PROFIT_PCT": None,
             "hard_stop_pct": HARD_STOP_PCT,
             "hedge_positions": True,
+            "max_ordinary_positions": 2,
             "reversal_trigger": REVERSAL_TRIGGER,
             "reversal_size_mult": REVERSAL_SIZE_MULT,
             "reversal_confirm_profit": REVERSAL_CONFIRM_PROFIT,
             "max_combined_loss_pct": None,
             "reversal_cooldown_sec": REVERSAL_COOLDOWN_SEC,
+            "reversal_signal_move": REVERSAL_SIGNAL_MOVE,
+            "reversal_signal_volume": REVERSAL_SIGNAL_VOLUME,
+            "reversal_signal_imbalance": REVERSAL_SIGNAL_IMBALANCE,
             "original_partial_fraction": 0.50,
             "post_reversal_stop_pct": 0.007,
             "post_reversal_stop_basis": "current_price",
@@ -100,9 +112,10 @@ class Final4PaperHunter(V2PaperHunter):
 
     async def enter(self, symbol, side, price):
         now = time.time()
-        if (
-            self.has_market_position(symbol)
-            or len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS
+        if not self.entry_permitted(symbol):
+            return False
+        if self.has_market_position(symbol) or len(self.positions) >= min(
+            2, self.strategy.MAX_CONCURRENT_POSITIONS
         ):
             return False
         if now - self.last_trade.get(symbol, -math.inf) < self.strategy.COOLDOWN_SEC:
@@ -118,7 +131,11 @@ class Final4PaperHunter(V2PaperHunter):
                 "market",
                 side,
                 1,
-                params={"quoteNotional": quote, "positionId": symbol},
+                params={
+                    "quoteNotional": quote,
+                    "positionId": symbol,
+                    **self.guarded_entry_params(price),
+                },
             )
             self.positions[symbol] = self.position(symbol, symbol, fill)
             self.last_trade[symbol] = now
@@ -155,11 +172,18 @@ class Final4PaperHunter(V2PaperHunter):
                 "reduceOnly": True,
                 "positionId": position_id,
                 "exit_reason": reason,
+                "stopPrice": (
+                    p["sl"]
+                    if reason
+                    in ("SL", "TIGHT_1", "TIGHT_2", "TIGHT_AFTER_REV", "PROFIT_LOCK")
+                    else None
+                ),
             },
         )
         self.exchange.trades[-1]["trigger_price"] = float(trigger_price)
         if p.get("is_reversal") or p.get("was_reversal"):
             self.last_reversal_time[symbol] = time.time()
+        self.last_trade[symbol] = time.time()
         del self.positions[position_id]
         for child in self.positions.values():
             if child.get("parent") == position_id:
@@ -185,12 +209,20 @@ class Final4PaperHunter(V2PaperHunter):
                     if move + 1e-12 >= trigger and trigger > p.get(
                         "profit_lock_trigger", 0
                     ):
-                        self.tighten_stop(
-                            p, p["entry"] * (1 + direction * lock), "PROFIT_LOCK"
+                        candidate = self.fee_aware_stop(p, lock)
+                        if direction * (price - candidate) <= 0:
+                            continue
+                        self.tighten_stop(p, candidate, "PROFIT_LOCK")
+                        p.update(
+                            profit_locked=direction * (p["sl"] / p["entry"] - 1),
+                            profit_lock_trigger=trigger,
                         )
-                        p.update(profit_locked=lock, profit_lock_trigger=trigger)
                         log.info(
-                            "PROFIT LOCK %s [%s] | +%.2f%%", symbol, key, lock * 100
+                            "PROFIT LOCK %s [%s] | actual=%.3f%% | stop=%.8f",
+                            symbol,
+                            key,
+                            p["profit_locked"] * 100,
+                            p["sl"],
                         )
                 if p.get("is_reversal"):
                     await self.check_reversal_success(key, price)
@@ -205,24 +237,77 @@ class Final4PaperHunter(V2PaperHunter):
                 log.warning("Position management failed %s: %s", key, error)
                 self.save()
 
+    async def detect_cascade(self, symbol):
+        # Reversal confirmation uses recent accepted candles, not another slow REST candle scan.
+        sc = self.scanner
+        if sc.execution_quote(symbol) is None:
+            return None
+        book = await asyncio.wait_for(
+            self.exchange.fetch_order_book(symbol, limit=20), 2.0
+        )
+        if sc.execution_quote(symbol) is None:
+            return None
+        rows = list(sc.histories.get(symbol, ()))
+        if len(rows) < 15:
+            return None
+        ret = rows[-1][4] / rows[-3][4] - 1
+        average = sum(r[5] for r in rows[-15:-3]) / 12
+        volume = rows[-1][5] / average if average > 0 else 0
+        bid = sum(float(x[1]) for x in book["bids"][:20])
+        ask = sum(float(x[1]) for x in book["asks"][:20])
+        imb = (bid - ask) / (bid + ask) if bid + ask > 0 else 0
+        return {
+            "long": ret >= REVERSAL_SIGNAL_MOVE
+            and volume >= REVERSAL_SIGNAL_VOLUME
+            and imb >= REVERSAL_SIGNAL_IMBALANCE,
+            "short": ret <= -REVERSAL_SIGNAL_MOVE
+            and volume >= REVERSAL_SIGNAL_VOLUME
+            and imb <= -REVERSAL_SIGNAL_IMBALANCE,
+            "ret": ret,
+            "volume": volume,
+            "imbalance": imb,
+        }
+
+    def reject_reversal(self, symbol, reason):
+        self.reversal_stats[reason] = self.reversal_stats.get(reason, 0) + 1
+        self.strategy.log.info("REVERSAL REJECTED %s | %s", symbol, reason)
+        self.save()
+        return False
+
     async def try_open_reversal(self, position_id, price, original_pos):
+        self.reversal_stats["attempts"] = self.reversal_stats.get("attempts", 0) + 1
+        symbol = original_pos.get("symbol", position_id)
         if original_pos.get("reversed") or original_pos.get("is_reversal"):
-            return False
+            return self.reject_reversal(symbol, "already_reversed")
         if self.positions.get(position_id) is not original_pos:
-            return False
+            return self.reject_reversal(symbol, "parent_missing")
         if len(self.positions) >= self.strategy.MAX_CONCURRENT_POSITIONS:
-            return False
+            return self.reject_reversal(symbol, "capacity")
         symbol = original_pos.get("symbol", position_id)
         if (
             time.time() - self.last_reversal_time.get(symbol, 0)
             <= REVERSAL_COOLDOWN_SEC
         ):
-            return False
+            return self.reject_reversal(symbol, "cooldown")
         reverse_side = "sell" if original_pos["side"] == "buy" else "buy"
-        sig = await self.detect_cascade(symbol)
+        self.strategy.log.info("REVERSAL CHECK %s | price=%.8f", symbol, price)
+        try:
+            sig = await self.detect_cascade(symbol)
+        except Exception as error:
+            log.warning("Reversal data check failed %s: %s", symbol, error)
+            return self.reject_reversal(symbol, "signal_data_error")
         if not sig or not (
             sig.get("long") if reverse_side == "buy" else sig.get("short")
         ):
+            self.reversal_stats["signal_rejected"] = (
+                self.reversal_stats.get("signal_rejected", 0) + 1
+            )
+            self.strategy.log.info(
+                "REVERSAL REJECTED %s | opposite signal missing | metrics=%s",
+                symbol,
+                sig,
+            )
+            self.save()
             return False
         reverse_id = symbol + "_REV_" + uuid4().hex
         try:
@@ -232,6 +317,7 @@ class Final4PaperHunter(V2PaperHunter):
                 reverse_side,
                 1,
                 params={
+                    **self.guarded_entry_params(price),
                     "hedge": True,
                     "positionId": reverse_id,
                     "hedgeParent": position_id,
@@ -254,6 +340,8 @@ class Final4PaperHunter(V2PaperHunter):
                 reversed=True, reverse_side=reverse_side, reverse_position_id=reverse_id
             )
             self.save()
+            price = float(fill["price"])
+            self.reversal_stats["opened"] = self.reversal_stats.get("opened", 0) + 1
             # تخفيف الأصلية فور نجاح المعاكسة، ثم شد وقف المتبقي.
             await self.partial_close_original(
                 position_id, 0.50, price, "REVERSAL_HEDGE"
@@ -278,6 +366,10 @@ class Final4PaperHunter(V2PaperHunter):
             )
             return False
         except Exception as error:
+            self.reversal_stats["execution_rejected"] = (
+                self.reversal_stats.get("execution_rejected", 0) + 1
+            )
+            self.save()
             log.warning("Reversal failed %s: %s", symbol, error)
             return False
 
@@ -301,6 +393,7 @@ class Final4PaperHunter(V2PaperHunter):
                     "reduceOnly": True,
                     "positionId": position_id,
                     "exit_reason": reason,
+                    "partialStop": p["sl"],
                 },
             )
             if position_id in self.exchange.positions:
@@ -312,6 +405,11 @@ class Final4PaperHunter(V2PaperHunter):
                 "%s %s | closed %.0f%% of original", reason, p["symbol"], fraction * 100
             )
             self.save()
+            return True
+        except PartialStopCrossed as error:
+            await self.close_position(
+                position_id, p.get("stop_kind", "SL"), error.price
+            )
             return True
         except Exception as e:
             log.warning("Partial close original failed: %s", e)

@@ -1,5 +1,5 @@
 # language: Python 3.11+, file: binance_cascade_hunter_dynamic_v2.py
-# target: Binance USDT-M Futures — Final-4 shared base: 10% wallet margin, 50x, max 5
+# target: Binance USDT-M Futures — Final-4 shared base: 1% wallet margin, 50x, max 3
 # deps: pip install ccxt pandas numpy aiohttp
 
 import asyncio
@@ -13,23 +13,26 @@ log = logging.getLogger("CASCADE")
 # === CONFIG ===
 
 LEVERAGE = 50
-MAX_POSITION_PCT = 0.10          # 10% من رصيد المحفظة الحالي كهامش للدخول الأول
-CASCADE_THRESHOLD = 0.012        # 1.2%
+MAX_POSITION_PCT = 0.01  # 1% من رصيد المحفظة الحالي
+CASCADE_THRESHOLD = 0.012  # 1.2%
 VOLUME_SPIKE = 3.5
 TAKE_PROFIT_PCT = 0.018
-STOP_LOSS_PCT = 0.03             # قيمة أساس 3%؛ Final-4 يثبت الوقف من سعر التنفيذ
-COOLDOWN_SEC = 8
+STOP_LOSS_PCT = 0.03  # قيمة أساس 3%؛ Final-4 يثبت الوقف من سعر التنفيذ
+COOLDOWN_SEC = 300
 
-SCAN_INTERVAL = 600              # 10 دقائق
-MAX_SYMBOLS_TO_SCAN = 40         # أعلى 40 عملة سيولة
-MAX_CONCURRENT_POSITIONS = 5     # أقصى عدد مراكز مفتوحة في نفس الوقت
-MIN_QUOTE_VOLUME = 15_000_000    # حجم تداول 24 ساعة أدنى (USDT)
+SCAN_INTERVAL = 600  # 10 دقائق
+MAX_SYMBOLS_TO_SCAN = 40  # أعلى 40 عملة سيولة
+MAX_CONCURRENT_POSITIONS = 3  # أقصى عدد مراكز مفتوحة في نفس الوقت
+MIN_QUOTE_VOLUME = 15_000_000  # حجم تداول 24 ساعة أدنى (USDT)
+
 
 class CascadeHunter:
     """V2 strategy methods; execution is supplied by the virtual account runtime."""
 
     def __init__(self):
-        raise RuntimeError("Use V2PaperHunter or run_paper_live.py for the paper account")
+        raise RuntimeError(
+            "Use Final4PaperHunter via cascade_final4_paper.py"
+        )
 
     async def set_leverage(self, symbol):
         try:
@@ -83,8 +86,12 @@ class CascadeHunter:
 
             imb = await self.get_orderbook_imbalance(symbol)
 
-            long_sig = ret_1m > CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb > 0.35
-            short_sig = ret_1m < -CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb < -0.35
+            long_sig = (
+                ret_1m > CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb > 0.35
+            )
+            short_sig = (
+                ret_1m < -CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb < -0.35
+            )
 
             strength = abs(ret_1m) * vol_spike * abs(imb)
 
@@ -96,7 +103,7 @@ class CascadeHunter:
                 "imb": imb,
                 "price": float(df1["c"].iloc[-1]),
                 "strength": strength,
-                "symbol": symbol
+                "symbol": symbol,
             }
         except Exception as e:
             log.debug(f"Detect failed {symbol}: {e}")
@@ -125,16 +132,23 @@ class CascadeHunter:
         try:
             await self.set_leverage(symbol)
             await self.exchange.create_order(
-                symbol, "market", side, amount,
-                params={"reduceOnly": False}
+                symbol, "market", side, amount, params={"reduceOnly": False}
             )
             self.last_trade[symbol] = now
             self.positions[symbol] = {
                 "side": side,
                 "entry": price,
                 "amount": amount,
-                "tp": price * (1 + TAKE_PROFIT_PCT) if side == "buy" else price * (1 - TAKE_PROFIT_PCT),
-                "sl": price * (1 - STOP_LOSS_PCT) if side == "buy" else price * (1 + STOP_LOSS_PCT)
+                "tp": (
+                    price * (1 + TAKE_PROFIT_PCT)
+                    if side == "buy"
+                    else price * (1 - TAKE_PROFIT_PCT)
+                ),
+                "sl": (
+                    price * (1 - STOP_LOSS_PCT)
+                    if side == "buy"
+                    else price * (1 + STOP_LOSS_PCT)
+                ),
             }
             log.info(f"ENTER {side.upper()} {symbol} size={amount:.4f} @ {price:.4f}")
             return True
@@ -149,16 +163,21 @@ class CascadeHunter:
                 ticker = await self.exchange.fetch_ticker(symbol)
                 price = ticker["last"]
 
-                hit_tp = (pos["side"] == "buy" and price >= pos["tp"]) or \
-                         (pos["side"] == "sell" and price <= pos["tp"])
-                hit_sl = (pos["side"] == "buy" and price <= pos["sl"]) or \
-                         (pos["side"] == "sell" and price >= pos["sl"])
+                hit_tp = (pos["side"] == "buy" and price >= pos["tp"]) or (
+                    pos["side"] == "sell" and price <= pos["tp"]
+                )
+                hit_sl = (pos["side"] == "buy" and price <= pos["sl"]) or (
+                    pos["side"] == "sell" and price >= pos["sl"]
+                )
 
                 if hit_tp or hit_sl:
                     close_side = "sell" if pos["side"] == "buy" else "buy"
                     await self.exchange.create_order(
-                        symbol, "market", close_side, pos["amount"],
-                        params={"reduceOnly": True}
+                        symbol,
+                        "market",
+                        close_side,
+                        pos["amount"],
+                        params={"reduceOnly": True},
                     )
                     reason = "TP" if hit_tp else "SL"
                     if hasattr(self, "record_exit_reason"):
@@ -171,18 +190,17 @@ class CascadeHunter:
         for s in to_remove:
             del self.positions[s]
 
-
     async def exit_watcher(self):
         """مراقبة الخروج بشكل مستمر بين المسحات"""
         while True:
             try:
                 async with self.lock:
                     await self.manage_exits()
-                await asyncio.sleep(8)
+                await asyncio.sleep(2)
             except Exception as e:
                 log.error(f"Exit watcher error: {e}")
                 await asyncio.sleep(15)
 
 
 if __name__ == "__main__":
-    raise SystemExit("Strategy module only. Run: python -u run_paper_live.py")
+    raise SystemExit("Strategy module only. Run: python -u cascade_final4_paper.py")

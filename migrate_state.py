@@ -102,9 +102,66 @@ def previous_reversal_settings():
     return settings
 
 
+LEGACY_APPROVED_SETTINGS = {
+    "mode": "final4_smart_reversal",
+    "LEVERAGE": 50,
+    "MAX_POSITION_PCT": 0.1,
+    "CASCADE_THRESHOLD": 0.012,
+    "VOLUME_SPIKE": 3.5,
+    "TAKE_PROFIT_PCT": None,
+    "STOP_LOSS_PCT": 0.028,
+    "COOLDOWN_SEC": 8,
+    "SCAN_INTERVAL": 600,
+    "MAX_SYMBOLS_TO_SCAN": 40,
+    "MAX_CONCURRENT_POSITIONS": 5,
+    "MIN_QUOTE_VOLUME": 15000000,
+    "position_basis": "wallet_total",
+    "stop_basis": "signal_price",
+    "hard_stop_pct": 0.028,
+    "hedge_positions": True,
+    "reversal_trigger": 0.018,
+    "reversal_size_mult": 0.45,
+    "reversal_confirm_profit": 0.007,
+    "max_combined_loss_pct": None,
+    "reversal_cooldown_sec": 600,
+    "original_partial_fraction": 0.5,
+    "post_reversal_stop_pct": 0.007,
+    "post_reversal_stop_basis": "current_price",
+    "profit_lock_levels": [
+        [0.01, 0.0001],
+        [0.015, 0.005],
+        [0.02, 0.01],
+        [0.025, 0.015],
+        [0.03, 0.02],
+        [0.035, 0.025],
+        [0.04, 0.03],
+    ],
+}
+
+
 def plan(path):
     state = json.loads(Path(path).read_text(encoding="utf-8"))
     current = current_settings()
+    if state.get("settings") == LEGACY_APPROVED_SETTINGS:
+        if state.get("account_positions") or state.get("strategy_positions"):
+            raise ValueError(
+                "Previous risk profile has OPEN positions. Keep that account unchanged; start a NEW --state or --fresh session for risk v2"
+            )
+        if (
+            state.get("version") != 1
+            or not isinstance(state.get("trades"), list)
+            or not isinstance(state.get("last_trade"), dict)
+        ):
+            raise ValueError("Invalid previous account; original preserved")
+        wallet = state.get("balance_usdt")
+        if not isinstance(wallet, (int, float)) or not math.isfinite(wallet):
+            raise ValueError("Invalid previous wallet; original preserved")
+        state["settings"] = current
+        state["risk_memory"] = {
+            "peak_balance": max(100.0, wallet),
+            "entries_paused": False,
+        }
+        return state, True
     if state.get("version") != 1:
         raise ValueError("Unknown state version; original preserved")
     if state.get("settings") == current:

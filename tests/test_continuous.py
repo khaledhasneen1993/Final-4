@@ -94,6 +94,7 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final4_enters_on_later_update_without_universe_refresh(self):
         from cascade_final4_paper import Final4PaperHunter
+
         self.bot = Final4PaperHunter(self.path, market_data=self.data)
         self.scanner.bot = self.bot
         self.scanner.ingest(event(close=100, volume=1))
@@ -170,9 +171,9 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         await self.scanner.evaluate(BTC)
         self.data.tickers = {ETH: {"quoteVolume": 40_000_000}}
         await self.scanner.refresh_universe()
-        self.assertEqual(self.scanner.symbols, (ETH,))
+        self.assertEqual(self.scanner.symbols, (ETH, BTC))
         self.assertIn(BTC, self.bot.positions)
-        self.assertIsNone(self.scanner.signal(BTC))
+        self.assertTrue(self.scanner.has_position(BTC))
         self.data.price = 105
         await self.bot.manage_exits()
         self.assertNotIn(BTC, self.bot.positions)

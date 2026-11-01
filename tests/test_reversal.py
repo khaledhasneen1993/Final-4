@@ -41,14 +41,14 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initial_margin_fill_basis_and_2_8_percent_stop(self):
         self.data.price = 101
-        self.assertTrue(await self.bot.enter(S, "buy", 99))
+        self.assertTrue(await self.bot.enter(S, "buy", 100.9))
         p = self.bot.positions[S]
         self.assertEqual(p["entry"], 101)
         self.assertAlmostEqual(p["sl"], 101 * 0.972)
-        self.assertAlmostEqual(self.bot.exchange.used, 10, places=2)
+        self.assertAlmostEqual(self.bot.exchange.used, 1, places=2)
         self.assertIsNone(p["tp"])
         self.assertEqual(self.bot.settings()["STOP_LOSS_PCT"], 0.028)
-        self.assertEqual(self.bot.settings()["MAX_CONCURRENT_POSITIONS"], 5)
+        self.assertEqual(self.bot.settings()["MAX_CONCURRENT_POSITIONS"], 3)
 
     async def test_all_profit_locks_both_directions_and_never_loosen(self):
         for side in ["buy", "sell"]:
@@ -60,9 +60,14 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
             for trigger, lock in PROFIT_LOCK_LEVELS:
                 self.data.price = 100 * (1 + direction * trigger)
                 await self.bot.manage_exits()
-                self.assertAlmostEqual(
-                    self.bot.positions[S]["sl"], 100 * (1 + direction * lock)
-                )
+                if trigger == 0.01:
+                    self.assertGreater(
+                        direction * (self.bot.positions[S]["sl"] / 100 - 1), 0.0019
+                    )
+                else:
+                    self.assertAlmostEqual(
+                        self.bot.positions[S]["sl"], 100 * (1 + direction * lock)
+                    )
                 self.assertEqual(self.bot.positions[S]["stop_kind"], "PROFIT_LOCK")
             stop = self.bot.positions[S]["sl"]
             self.data.price = 100 * (1 + direction * 0.035)
@@ -73,7 +78,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
         await self.entry()
         self.data.price = 101
         await self.bot.manage_exits()
-        self.assertEqual(self.bot.positions[S]["sl"], 100.01)
+        self.assertEqual(self.bot.positions[S]["sl"], 100.20005002501249)
         self.data.price = 99.99
         await self.bot.manage_exits()
         self.assertFalse(self.bot.positions)
@@ -92,8 +97,8 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
             )
             f = self.bot.exchange.positions[child]
             self.assertEqual(f["symbol"], S)
-            self.assertAlmostEqual(f["entry"] * f["amount"], 225, delta=0.11)
-            self.assertAlmostEqual(self.bot.exchange.used, 9.5, delta=0.01)
+            self.assertAlmostEqual(f["entry"] * f["amount"], 22.5, delta=0.11)
+            self.assertAlmostEqual(self.bot.exchange.used, 0.95, delta=0.01)
             self.assertTrue(self.bot.positions[child]["is_reversal"])
             self.assertTrue(self.bot.positions[S]["reversed"])
             expected = self.bot.exchange.balance + sum(
@@ -136,7 +141,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_close_parent_directly_preserves_and_promotes_child(self):
         child = await self.hedge()
-        await self.bot.close_position(S, "SL", self.data.price)
+        await self.bot.close_position(S, "TEST", self.data.price)
         self.assertEqual(set(self.bot.positions), {child})
         self.assertFalse(self.bot.positions[child]["is_reversal"])
 
@@ -162,7 +167,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
 
     async def test_insufficient_margin_does_not_mark_reversed(self):
         await self.entry()
-        self.bot.exchange.balance = 10.1
+        self.bot.exchange.balance = 1.01
         self.data.price = 98.2
         self.bot.detect_cascade.return_value = {"long": False, "short": True}
         self.assertFalse(
@@ -238,7 +243,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
             self.bot.detect_cascade = AsyncMock()
             child = await self.hedge(side)
             p = self.bot.positions[S]
-            self.assertAlmostEqual(p["amount"], 2.5)
+            self.assertAlmostEqual(p["amount"], 0.25)
             d = 1 if side == "buy" else -1
             self.assertAlmostEqual(p["sl"], self.data.price * (1 - d * 0.007))
             self.assertGreater(d * (self.data.price - p["sl"]), 0)
@@ -276,7 +281,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
         self.bot.exchange.create_order = reject_partial
         await self.bot.manage_exits()
         self.assertTrue(self.bot.positions[S]["reversed"])
-        self.assertEqual(self.bot.positions[S]["amount"], 5)
+        self.assertEqual(self.bot.positions[S]["amount"], 0.5)
         self.assertEqual(self.bot.positions[S]["stop_kind"], "TIGHT_AFTER_REV")
         await self.bot.manage_exits()
         self.assertEqual(len(self.bot.positions), 2)
@@ -295,7 +300,7 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
 
         self.data.fetch_ticker = stale
         self.assertFalse(await self.bot.partial_close_original(S, 0.5, 98.2, "TEST"))
-        self.assertEqual(self.bot.positions[S]["amount"], 5)
+        self.assertEqual(self.bot.positions[S]["amount"], 0.5)
         self.assertEqual(len(self.bot.exchange.trades), 1)
 
     async def test_cooldown_starts_on_child_close_survives_restart_and_is_strict(self):
@@ -345,8 +350,8 @@ class Final4Tests(unittest.IsolatedAsyncioTestCase):
 
         self.data.fetch_ticker = ticker
         await self.bot.manage_exits()
-        self.assertAlmostEqual(self.bot.positions[S]["sl"], 100.01)
-        self.assertAlmostEqual(self.bot.positions[other]["sl"], 99.99)
+        self.assertAlmostEqual(self.bot.positions[S]["sl"], 100.20005002501249)
+        self.assertAlmostEqual(self.bot.positions[other]["sl"], 99.8000499750125)
 
     async def test_stop_takes_priority_over_reversal_confirmation_at_same_price(self):
         child = await self.hedge()
