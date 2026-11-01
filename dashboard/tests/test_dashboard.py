@@ -93,17 +93,17 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
 if __name__=='__main__':unittest.main()
 
 
-class PairTests(unittest.IsolatedAsyncioTestCase):
+class TripleTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = DashboardTests.asyncSetUp
     asyncTearDown = DashboardTests.asyncTearDown
     async def test_pair_and_final4_export(self):
-        self.assertEqual(server.NAMES, ('final', 'final4'))
+        self.assertEqual(server.NAMES, ('final', 'final3', 'final4'))
         state = dict(updated_at=time.time(), balance_usdt=20.5, equity_usdt=20.5,
             settings={'STOP_LOSS_PCT': .07}, trades=[])
         (server.RUNTIME/'data/final4.snapshot.json').write_text(json.dumps(state))
         response = await self.client.get('/api/status', headers=self.host)
         payload = await response.json()
-        self.assertEqual(set(payload['bots']), {'final', 'final4'})
+        self.assertEqual(set(payload['bots']), {'final', 'final3', 'final4'})
         self.assertEqual(payload['bots']['final4']['source']['repository'], 'Final-4')
         self.assertEqual(payload['bots']['final4']['balance_usdt'], 20.5)
         response = await self.client.get('/export/final4/snapshot', headers=self.host)
@@ -113,3 +113,42 @@ class PairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 404)
         response = await self.client.get('/', headers=self.host)
         self.assertIn('data-bot="final4"', await response.text())
+
+class CombinedExportTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp = DashboardTests.asyncSetUp
+    asyncTearDown = DashboardTests.asyncTearDown
+
+    async def test_export_all_preserves_bot_identity_and_partial_fills(self):
+        for name in server.NAMES:
+            rows = [dict(id='1',symbol='BTC',position_id='BTC',side='buy',amount=2,price=100,fee_usdt=.1,reduceOnly=False),
+                    dict(id='2',symbol='BTC',position_id='BTC',side='sell',amount=1,price=99,fee_usdt=.05,reduceOnly=True,pnl_usdt=-1,partial_close=True)]
+            state = dict(updated_at=time.time(), balance_usdt=100, equity_usdt=100, trades=rows)
+            (server.RUNTIME/'data'/f'{name}.snapshot.json').write_text(json.dumps(state))
+        response = await self.client.get('/export/all/snapshot', headers=self.host)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(set((await response.json())['bots']), set(server.NAMES))
+        response = await self.client.get('/export/all/fills', headers=self.host)
+        text = await response.text()
+        import csv, io
+        rows = list(csv.DictReader(io.StringIO(text.lstrip('\ufeff'))))
+        self.assertEqual(len(rows), 6)
+        self.assertEqual({row['bot'] for row in rows}, set(server.NAMES))
+        self.assertEqual(sum(row['reduceOnly']=='True' for row in rows), 3)
+        response = await self.client.get('/export/all/closed', headers=self.host)
+        self.assertEqual(response.status, 200)
+        rows = list(csv.DictReader(io.StringIO((await response.text()).lstrip('\ufeff'))))
+        self.assertFalse(rows)
+
+    async def test_all_three_workers_are_separate_subprocesses(self):
+        class Process:
+            returncode = None
+            def send_signal(self, sig): self.returncode = 0
+            async def wait(self): return self.returncode
+        async def no_logs(*args): pass
+        with patch('asyncio.create_subprocess_exec', side_effect=lambda *args, **kwargs: Process()) as spawn, patch.object(self.supervisor, 'read_logs', no_logs):
+            for name in server.NAMES:
+                await self.supervisor.start(name)
+            self.assertEqual(spawn.call_count, 3)
+            self.assertEqual({c.args[-1] for c in spawn.call_args_list}, set(server.NAMES))
+            for name in server.NAMES:
+                await self.supervisor.stop(name)

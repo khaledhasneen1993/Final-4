@@ -1,4 +1,4 @@
-"""Loopback dashboard and supervisor for two isolated paper workers."""
+"""Loopback dashboard and supervisor for three isolated paper workers."""
 import argparse
 import asyncio
 import csv
@@ -17,8 +17,7 @@ from pathlib import Path
 from aiohttp import web
 from ledger import round_trips
 
-from paths import ASSETS, RUNTIME, SOURCES
-NAMES = ('final', 'final4')
+from paths import ASSETS, RUNTIME, SOURCES, NAMES, LABELS, STATE_PATHS
 
 class Supervisor:
     def __init__(self):
@@ -34,7 +33,7 @@ class Supervisor:
                 commit = subprocess.check_output(['git','-C',str(path),'rev-parse','--short','HEAD'],text=True,stderr=subprocess.DEVNULL).strip()
             except (OSError,subprocess.CalledProcessError):
                 commit = 'unknown'
-            self.sources[name] = {'repository': 'Final' if name=='final' else 'Final-4', 'commit': commit}
+            self.sources[name] = {'repository': LABELS[name], 'commit': commit}
         (RUNTIME/'data').mkdir(parents=True,exist_ok=True)
         (RUNTIME/'logs').mkdir(exist_ok=True)
         self.db = sqlite3.connect(RUNTIME/'data/history.sqlite')
@@ -58,6 +57,7 @@ class Supervisor:
             env.pop('CASCADE_DASHBOARD_TOKEN', None)
             env['CASCADE_RUNTIME_DIR'] = str(RUNTIME)
             env['CASCADE_FINAL_DIR'] = str(SOURCES['final'])
+            env['CASCADE_FINAL3_DIR'] = str(SOURCES['final3'])
             self.started[name] = time.time()
             self.procs[name] = await asyncio.create_subprocess_exec(
                 sys.executable, '-u', str(ASSETS/'worker.py'), name, cwd=ASSETS, env=env,
@@ -100,7 +100,10 @@ class Supervisor:
         try:
             s = json.loads((RUNTIME/'data'/f'{name}.snapshot.json').read_text())
         except (OSError, ValueError):
-            s = {}
+            try:
+                s = json.loads(STATE_PATHS[name].read_text())
+            except (OSError, ValueError):
+                s = {}
         updated = s.get('updated_at', 0)
         age = time.time()-updated if updated else None
         fresh_run = updated >= self.started.get(name, 0)
@@ -173,12 +176,14 @@ def make_app(supervisor, autostart=True):
         return web.json_response({'ok':True})
     async def export(request):
         name, kind = request.match_info['name'], request.match_info['kind']
-        if name not in NAMES or kind not in ('fills','closed','snapshot'):
+        if name not in (*NAMES, 'all') or kind not in ('fills','closed','snapshot'):
             raise web.HTTPNotFound()
-        s = supervisor.snapshot(name)
+        snapshots = {n: supervisor.snapshot(n) for n in (NAMES if name == 'all' else (name,))}
         if kind == 'snapshot':
-            return web.json_response(s,headers={'Content-Disposition':f'attachment; filename="{name}-snapshot.json"'})
-        rows = s.get('trades' if kind=='fills' else 'closed_trades',[])
+            payload = {'exported_at': time.time(), 'bots': snapshots} if name == 'all' else snapshots[name]
+            return web.json_response(payload,headers={'Content-Disposition':f'attachment; filename="{name}-snapshot.json"'})
+        field = 'trades' if kind == 'fills' else 'closed_trades'
+        rows = [{**row, 'bot': n, 'bot_name': LABELS[n]} for n, snapshot in snapshots.items() for row in snapshot.get(field, [])]
         keys = sorted({k for row in rows for k in row})
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=keys)

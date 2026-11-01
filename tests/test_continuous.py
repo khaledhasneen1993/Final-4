@@ -92,6 +92,22 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
                     task.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
 
+    async def test_final4_enters_on_later_update_without_universe_refresh(self):
+        from cascade_final4_paper import Final4PaperHunter
+        self.bot = Final4PaperHunter(self.path, market_data=self.data)
+        self.scanner.bot = self.bot
+        self.scanner.ingest(event(close=100, volume=1))
+        await self.scanner.evaluate(BTC)
+        self.assertFalse(self.bot.positions)
+        symbols = self.scanner.symbols
+        self.mono += 30
+        self.wall += 30
+        self.scanner.ingest(event(offset=30000))
+        await self.scanner.evaluate(BTC)
+        self.assertIn(BTC, self.bot.positions)
+        self.assertEqual(self.scanner.symbols, symbols)
+        self.assertEqual(self.scanner.entries, 1)
+
     async def test_concurrent_signals_open_three_positions(self):
         for symbol in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
             self.scanner.ingest(event(symbol))

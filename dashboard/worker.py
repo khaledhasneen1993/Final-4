@@ -22,6 +22,8 @@ fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 sys.path.insert(0, str(SOURCES[NAME]))
 if NAME == 'final':
     from binance_cascade_hunter_dynamic_v2_paper import V2PaperHunter as Hunter
+elif NAME == 'final3':
+    from cascade_final3_paper import Final3PaperHunter as Hunter
 else:
     from cascade_final4_paper import Final4PaperHunter as Hunter
 
